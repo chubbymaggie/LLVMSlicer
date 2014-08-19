@@ -2,6 +2,7 @@
 // License. See LICENSE.TXT for details.
 
 #include <map>
+#include <unordered_map>
 
 #include "llvm/BasicBlock.h"
 #include "llvm/DataLayout.h"
@@ -199,24 +200,404 @@ void CallMaps::buildCallMaps(const Module &M) {
 
 }}}
 
+namespace llvm {
+namespace ptr {
+
+
+// This is an implementation of Shapiro-Horwitz analysis
+//
+// See details at:
+// https://is.muni.cz/auth/th/396236/fi_b/?fakulta=1433;obdobi=5984;studium=576656;lang=cs;sorter=tema;balik=1275
+// http://www.eecs.umich.edu/acal/swerve/docs/54-1.pdf
+///
+PointsToGraph::~PointsToGraph()
+{
+    std::unordered_map<Pointer, Node *>::iterator I, E;
+
+    for (I = Nodes.begin(), E = Nodes.end(); I != E; ++I) {
+        if (I->second) {
+            replaceNode(I->second, NULL);
+            delete I->second;
+        }
+    }
+
+    // PointsToGraph adopts the category, since it must be
+    // allocated on heap because of virtual functions
+    delete PTC;
+}
+
+static void printPtrName(const PointsToGraph::Pointee p)
+{
+    const llvm::LoadInst *LInst;
+    const llvm::Value *val = p.first;
+
+    if (isa<CastInst>(p.first)) {
+        errs() << "BT: ";
+        val = val->stripPointerCasts();
+    } else if ((LInst = dyn_cast<LoadInst>(val))) {
+        errs() << "LD: ";
+        val = LInst->getPointerOperand();
+    }
+
+	if (isa<GlobalValue>(val))
+		errs() << "@";
+    else
+		errs() << "%";
+
+    if (val->hasName())
+	    errs() << val->getName().data();
+    else
+        errs() << val->getValueID();
+
+    if (p.second >= 0)
+        errs() << " + " << p.second;
+}
+
+void PointsToGraph::Node::dump(void) const
+{
+    ElementsTy::const_iterator Begin = Elements.begin();
+
+    errs() << "[";
+
+    for (ElementsTy::const_iterator I = Begin, E = Elements.end();
+         I != E; ++I) {
+        if (I != Begin)
+            errs() << ", ";
+
+        printPtrName(*I);
+    }
+
+    errs() << "]\n";
+}
+
+void PointsToGraph::dump(void) const
+{
+    std::unordered_map<Pointer, Node *>::const_iterator I, E;
+
+    if (Nodes.empty()) {
+        errs() << "PointsToGraph is empty\n";
+        return;
+    }
+
+    for(I = Nodes.begin(), E = Nodes.end(); I != E; ++I) {
+        if (!I->second)
+            continue;
+
+        I->second->dump();
+
+        Node::EdgesTy Edges = I->second->getEdges();
+        for (unsigned int I = 0; I < Node::EDGES_NUM; ++I) {
+            if (!Edges[I])
+                continue;
+
+            errs() << "    --> ";
+            Edges[I]->dump();
+        }
+    }
+}
+
+void PointsToGraph::replaceNode(PointsToGraph::Node *a,
+                                PointsToGraph::Node *b)
+{
+    assert(a && "a must not be NULL");
+
+    Node::ElementsTy& Elements = a->getElements();
+
+    for (Node::ElementsTy::iterator I = Elements.begin(), E = Elements.end();
+         I != E; ++I) {
+        Node *&n = Nodes[*I];
+        n = b;
+    }
+}
+
+inline PointsToGraph::Node *PointsToGraph::findNode(Pointee p) const
+{
+    std::unordered_map<Pointer, Node *>::const_iterator I;
+    I = Nodes.find(p);
+
+    if (I == Nodes.end())
+        return NULL;
+    else
+        return I->second;
+}
+
+inline PointsToGraph::Node *PointsToGraph::addNode(Pointee p)
+{
+    Node *n = new Node(p, this);
+    Nodes[p] = n;
+
+    return n;
+}
+
+// get or create new node
+// it accesses Nodes only once contrary to findNode() + addNode()
+inline PointsToGraph::Node *PointsToGraph::getNode(Pointee P)
+{
+    // hmm, is this defined? If Node(P) does not exit,
+    // it could return some garbage.. Anyway, it looks like
+    // working
+    Node *&n = Nodes[P];
+
+    if (!n)
+        n = new Node(P, this);
+
+    return n;
+}
+
+// XXX do in Node's member function?
+void PointsToGraph::replaceEdges(Node *a, Node *b)
+{
+    assert(a && "a must not be NULL");
+    assert(b && "b must not be NULL");
+
+    Node::ReferencesTy& References = b->getReferences();
+    Node::EdgesTy Edges = b->getEdges();
+
+    // change edges that points to b so that they will point to a
+    for (Node::ReferencesTy::iterator I = References.begin(),
+         E = References.end(); I != E; ++I) {
+
+         // delete edges that points to b
+         (*I)->removeNeighbour(b->getCategory());
+         // and add edges that points to a instead
+         (*I)->addNeighbour(a);
+    }
+
+    // change references of outgoing edges
+    for (unsigned int I = 0; I < Node::EDGES_NUM; ++I)
+        if (Edges[I]) {
+            Edges[I]->getReferences().erase(b);
+            a->addNeighbour(Edges[I]);
+        }
+}
+
+void PointsToGraph::mergeNodes(Node *a, Node *b)
+{
+    Node::ElementsTy& ElementsB = b->getElements();
+
+    // copy elements from b to a
+    for (Node::ElementsTy::iterator I = ElementsB.begin(), E = ElementsB.end();
+         I != E; ++I) {
+        a->insert(*I);
+
+        // set new location node for the element
+        Nodes[*I] = a;
+    }
+
+    // make all nodes that point to b point to a
+    replaceEdges(a, b);
+
+    delete b;
+
+    // if there were some edges with the same category, then these should
+    // be merged in addNeighbour called from replaceEdges, so we're done here
+}
+
+bool PointsToGraph::insert(Pointer p, Pointee location)
+{
+    bool changed = false;
+
+    // find node that contains pointer p. From this node will
+    // be created new outgoing edge (if needed)
+    PointsToGraph::Node *From, *To;
+
+    From = getNode(p);
+    To = findNode(location);
+
+    if (To) {
+        // addNeighbour should merge the nodes if necessary
+        changed = From->addNeighbour(To);
+    } else {
+        // pointer is not in any node. Check if From node
+        // has neighbour with the same category. If so, just
+        // add the pointer there
+        Node *n = From->getEdges()[PTC->getCategory(location)]; 
+
+        if (n) {
+            n->insert(location);
+            Nodes[location] = n;
+            changed = true;
+        } else {
+            To = getNode(location);
+            changed = From->addNeighbour(To);
+        }
+    }
+
+    return changed;
+}
+
+bool PointsToGraph::insert(Pointer p, std::set<Pointee>& locations)
+{
+    std::set<Pointee>::iterator I, E;
+    bool changed = false;
+
+    for (I = locations.begin(), E = locations.end(); I != E; ++I)
+        changed |= insert(p, *I);
+
+    return changed;
+}
+
+bool PointsToGraph::insertDerefPointee(Node *PointerNode, Node *LocationNode)
+{
+    bool changed = false;
+
+    Node::EdgesTy Edges = LocationNode->getEdges();
+
+    for (unsigned int I = 0; I < Node::EDGES_NUM; ++I)
+        if (Edges[I])
+            changed |= PointerNode->addNeighbour(Edges[I]);
+
+    return changed;
+}
+
+bool PointsToGraph::insertDerefPointee(Pointer p, Node *LocationNode)
+{
+    if (!LocationNode->hasNeighbours())
+        return false;
+
+    return insertDerefPointee(getNode(p), LocationNode);
+}
+
+bool PointsToGraph::insertDerefPointee(Pointer p, Pointee location)
+{
+    PointsToGraph::Node *LocationNode;
+    bool changed = false;
+
+    LocationNode = findNode(location);
+
+    if (!LocationNode) {
+        // If location do not have a node yet, then it do not have
+        // neighbours which should be inserted.
+        // XXX maybe we should write out a message about unsoundness,
+        // since we're dereferencing pointer pointing to unknown location
+        return false;
+    }
+
+    return insertDerefPointee(p, LocationNode);
+}
+
+bool PointsToGraph::insertDerefPointer(Node *PointerNode, Node *LocationNode)
+{
+    bool changed = false;
+
+    Node::EdgesTy Edges = PointerNode->getEdges();
+
+    for (unsigned int I = 0; I < Node::EDGES_NUM; ++I)
+        if (Edges[I])
+            changed |= Edges[I]->addNeighbour(LocationNode);
+
+    return changed;
+}
+
+bool PointsToGraph::insertDerefPointer(Node *PointerNode, Pointee location)
+{
+    if (!PointerNode->hasNeighbours())
+        return false;
+
+    return insertDerefPointer(PointerNode, getNode(location));
+}
+
+
+bool PointsToGraph::insertDerefPointer(Pointer p, Pointee location)
+{
+    PointsToGraph::Node *PointerNode;
+    bool changed = false;
+
+    PointerNode = findNode(p);
+
+    if (!PointerNode)
+        return false;
+
+    return insertDerefPointer(PointerNode, location);
+}
+
+bool PointsToGraph::insertDerefBoth(Node *PointerNode, Node *LocationNode)
+{
+    bool changed = false;
+
+    Node::EdgesTy Edges = PointerNode->getEdges();
+
+    for (unsigned int I = 0; I < Node::EDGES_NUM; ++I)
+        if (Edges[I])
+            changed |= insertDerefPointee(Edges[I], LocationNode);
+
+    return changed;
+}
+
+void PointsToGraph::Node::convertToPointsToSets(PointsToSets& PS,
+                                                bool intersect) const
+{
+    typedef PointsToSets::PointsToSet PTSet;
+    typedef PointsToSets::Pointer Ptr;
+
+    for (ElementsTy::const_iterator ElemI = Elements.begin(),
+         ElemE = Elements.end();
+         ElemI != ElemE; ++ElemI) {
+
+        PTSet& S = PS[*ElemI];
+        PTSet TmpPTSet;
+
+        for (unsigned int I = 0; I < EDGES_NUM; ++I) {
+            if (!Edges[I])
+                continue;
+
+            const ElementsTy& Ptees = Edges[I]->getElements();
+
+            if (intersect) {
+                // when creating intersection, add the intersection into
+                // TmpPTSet (if there are more outgoing edges from a node,
+                // then I need to accumulate intersections from all these nodes
+                std::set_intersection(S.begin(), S.end(),
+                                      Ptees.begin(), Ptees.end(),
+                                      std::inserter(TmpPTSet, TmpPTSet.end()));
+
+            } else {
+                std::copy(Ptees.begin(), Ptees.end(),
+                          std::inserter(S, S.end()));
+            }
+        }
+
+        if (intersect) {
+            // store accumulated intersection in original pt set
+            S.swap(TmpPTSet);
+
+            // clean empty nodes. Empty nodes can be created only by
+            // intersection
+            if (S.empty())
+                PS.getContainer().erase(PS.find(*ElemI));
+        }
+    }
+}
+
+PointsToSets& PointsToGraph::toPointsToSets(PointsToSets& PS) const
+{
+    std::unordered_map<Pointer, Node *>::const_iterator I, E;
+    bool intersect = !PS.getContainer().empty();
+
+    for (I = Nodes.cbegin(), E = Nodes.cend(); I != E; ++I)
+        if (I->second && (I->second)->hasNeighbours())
+            (I->second)->convertToPointsToSets(PS, intersect);
+
+    return PS;
+}
+
+} // namespace ptr
+} // namespace llvm
+
 namespace llvm { namespace ptr {
 
 typedef PointsToSets::PointsToSet PTSet;
 typedef PointsToSets::Pointer Ptr;
 
-static bool applyRule(PointsToSets &S, ASSIGNMENT<
-		    VARIABLE<const llvm::Value *>,
-		    VARIABLE<const llvm::Value *>
-		    > const& E) {
+bool PointsToGraph::applyRule(ASSIGNMENT<
+                                VARIABLE<const llvm::Value *>,
+                                VARIABLE<const llvm::Value *>
+                              > const& E)
+{
     const llvm::Value *lval = E.getArgument1().getArgument();
     const llvm::Value *rval = E.getArgument2().getArgument();
-    PTSet &L = S[Ptr(lval, -1)];
-    const PTSet &R = S[Ptr(rval, -1)];
-    const std::size_t old_size = L.size();
 
-    std::copy(R.begin(), R.end(), std::inserter(L, L.end()));
-
-    return old_size != L.size();
+    return insertDerefPointee(Ptr(lval, -1), Ptr(rval, -1));
 }
 
 static int64_t accumulateConstantOffset(const GetElementPtrInst *gep,
@@ -266,263 +647,251 @@ static bool checkOffset(const DataLayout &DL, const Value *Rval, uint64_t sum) {
   return true;
 }
 
-static bool applyRule(PointsToSets &S, const llvm::DataLayout &DL, ASSIGNMENT<
-		    VARIABLE<const llvm::Value *>,
-		    GEP<VARIABLE<const llvm::Value *> >
-		    > const& E) {
+bool PointsToGraph::applyRule(const llvm::DataLayout &DL,
+                              ASSIGNMENT<
+                                VARIABLE<const llvm::Value *>,
+                                GEP<VARIABLE<const llvm::Value *> >
+                              > const& E)
+{
     const llvm::Value *lval = E.getArgument1().getArgument();
     const llvm::Value *rval = E.getArgument2().getArgument().getArgument();
-    PTSet &L = S[Ptr(lval, -1)];
-    const std::size_t old_size = L.size();
+    bool changed = false;
 
     const GetElementPtrInst *gep = dyn_cast<GetElementPtrInst>(rval);
     const llvm::Value *op = elimConstExpr(gep->getPointerOperand());
     bool isArray = false;
     int64_t off = accumulateConstantOffset(gep, DL, isArray);
+    Ptr L(lval, -1);
 
     if (hasExtraReference(op)) {
-	L.insert(Ptr(op, off)); /* VAR = REF */
-    } else {
-	const PTSet &R = S[Ptr(op, -1)];
-	for (PTSet::const_iterator I = R.begin(), E = R.end(); I != E; ++I) {
-	    assert(I->second >= 0);
+        changed = insert(L, Ptr(op, off)); /* VAR = REF */
+    } else { /* VAR = VAR */
 
-	    /* disable recursive structures */
-	    if (L.count(*I))
-		    continue;
+        Ptr R(op, -1);
+        Node *n = findNode(R);
 
-	    const Value *Rval = I->first;
+        if (!n || !n->hasNeighbours())
+            return false;
 
-	    if (off && (isa<Function>(Rval) || isa<ConstantPointerNull>(Rval)))
-	      continue;
+        Node::EdgesTy Edges = n->getEdges();
+        for (unsigned int I = 0; I < Node::EDGES_NUM; ++I) {
+            if (!Edges[I])
+                continue;
 
-	    int64_t sum = I->second + off;
+            // if it's an array, go backward and find last offset
+            // (set is sorted). It can introduce some unsoundness,
+            // but for most cases it's working pretty well
+            Node::ElementsTy& Elems = Edges[I]->getElements();
+            Node::ElementsTy::reverse_iterator PI, PE;
+            for (PI = Elems.rbegin(), PE = Elems.rend(); PI != PE; ++PI) {
 
-	    if (!checkOffset(DL, Rval, sum))
-	      continue;
+                 // offset with variable has no meaning
+                 if (PI->second == -1)
+                    continue;
 
-	    unsigned int sameCount = 0;
-	    for (PTSet::const_iterator II = L.begin(), EE = L.end();
-		II != EE; ++II) {
-	      if (II->first == Rval)
-		if (++sameCount >= 5)
-		  break;
-	    }
+                const Value *val = PI->first;
 
-	    if (sameCount >= 3) {
-#ifdef DEBUG_CROPPING
-	      errs() << "dropping GEP ";
-	      gep->dump();
-	      errs() << "\tHAVE " << off << "+" << " OFF=" << I->second << " ";
-	      Rval->dump();
-#endif
-	      continue;
-	    }
+                // there's no point to have offset with these values
+                if (isa<Function>(val) || isa<ConstantPointerNull>(val))
+                    continue;
 
-	    if (sum < 0) {
-		    assert(I->second >= 0);
-#ifdef DEBUG_CROPPING
-		    errs() << "variable index, cropping to 0: " <<
-			    I->second << "+" << off << "\n\t";
-		    gep->dump();
-		    errs() << "\tPTR=";
-		    Rval->dump();
-#endif
-		    sum = 0;
-	    }
+                int64_t sum = PI->second + off;
 
-	    /* an unsoundness :) */
-	    if (isArray && sum > 64)
-		sum = 64;
+                if (isArray) {
+                    if (sum < 0)
+                        sum = 0;
+                    /* unsoundnes :-) */
+                    else if (sum > 64)
+                        sum = 64;
+                }
 
-	    L.insert(Ptr(Rval, sum)); /* V = V */
-	}
+                if (!checkOffset(DL, val, sum))
+                    continue;
+
+                changed |= insert(L, Ptr(val, sum));
+                break; // we're done!
+            }
+        }
     }
 
-    return old_size != L.size();
+    return changed;
 }
 
-static bool applyRule(PointsToSets &S, ASSIGNMENT<
-		    VARIABLE<const llvm::Value *>,
-		    REFERENCE<VARIABLE<const llvm::Value *> >
-		    > const& E) {
-    const llvm::Value *lval = E.getArgument1().getArgument();
-    const llvm::Value *rval = E.getArgument2().getArgument().getArgument();
-    PTSet &L = S[Ptr(lval, -1)];
-    const std::size_t old_size = L.size();
-
-    L.insert(Ptr(rval, 0));
-
-    return old_size != L.size();
-}
-
-static bool applyRule(PointsToSets &S, ASSIGNMENT<
-		    VARIABLE<const llvm::Value *>,
-		    DEREFERENCE< VARIABLE<const llvm::Value *> >
-		    > const& E, const int idx = -1)
+bool PointsToGraph::applyRule(ASSIGNMENT<
+                                VARIABLE<const llvm::Value *>,
+                                REFERENCE<VARIABLE<const llvm::Value *> >
+                              > const& E)
 {
     const llvm::Value *lval = E.getArgument1().getArgument();
     const llvm::Value *rval = E.getArgument2().getArgument().getArgument();
-    PTSet &L = S[Ptr(lval, idx)];
-    PTSet &R = S[Ptr(rval, -1)];
-    const std::size_t old_size = L.size();
 
-    for (PTSet::const_iterator i = R.begin(); i!=R.end(); ++i) {
-	PTSet &X = S[*i];
-	std::copy(X.begin(), X.end(), std::inserter(L, L.end()));
-    }
-
-    return old_size != L.size();
+    return insert(Ptr(lval, -1), Ptr(rval, 0));
 }
 
-static bool applyRule(PointsToSets &S, ASSIGNMENT<
-		    DEREFERENCE<VARIABLE<const llvm::Value *> >,
-		    VARIABLE<const llvm::Value *>
-		    > const& E)
+bool PointsToGraph::applyRule(ASSIGNMENT<
+                                VARIABLE<const llvm::Value *>,
+                                DEREFERENCE< VARIABLE<const llvm::Value *> >
+                              > const& E, const int idx)
 {
-    const llvm::Value *lval = E.getArgument1().getArgument().getArgument();
-    const llvm::Value *rval = E.getArgument2().getArgument();
-    PTSet &L = S[Ptr(lval, -1)];
-    PTSet &R = S[Ptr(rval, -1)];
+    const llvm::Value *lval = E.getArgument1().getArgument();
+    const llvm::Value *rval = E.getArgument2().getArgument().getArgument();
     bool change = false;
 
-    for (PTSet::const_iterator i = L.begin(); i != L.end(); ++i) {
-	PTSet &X = S[*i];
-	const std::size_t old_size = X.size();
+    Ptr L(lval, idx);
 
-	std::copy(R.begin(), R.end(), std::inserter(X, X.end()));
-	change = change || X.size() != old_size;
-    }
+    Node *r = findNode(Ptr(rval, -1));
+    if (!r)
+        return false;
+
+    Node::EdgesTy Edges = r->getEdges();
+    for (unsigned int I = 0; I < Node::EDGES_NUM; ++I)
+        if (Edges[I])
+            // must process nodes *two* steps away
+            change |= insertDerefPointee(L, Edges[I]);
 
     return change;
 }
 
-static bool applyRule(PointsToSets &S, ASSIGNMENT<
-		    DEREFERENCE<VARIABLE<const llvm::Value *> >,
-		    REFERENCE<VARIABLE<const llvm::Value *> >
-		    > const &E)
+bool PointsToGraph::applyRule(ASSIGNMENT<
+                                DEREFERENCE<VARIABLE<const llvm::Value *> >,
+                                VARIABLE<const llvm::Value *>
+                              > const& E)
+{
+    const llvm::Value *lval = E.getArgument1().getArgument().getArgument();
+    const llvm::Value *rval = E.getArgument2().getArgument();
+
+    Node *l = findNode(Ptr(lval, -1));
+    if (!l)
+        return false;
+
+    Node *r = findNode(Ptr(rval, -1));
+    if (!r)
+         return false;
+
+    return insertDerefBoth(l, r);
+}
+
+bool PointsToGraph::applyRule(ASSIGNMENT<
+                                DEREFERENCE<VARIABLE<const llvm::Value *> >,
+                                REFERENCE<VARIABLE<const llvm::Value *> >
+                              > const &E)
 {
     const llvm::Value *lval = E.getArgument1().getArgument().getArgument();
     const llvm::Value *rval = E.getArgument2().getArgument().getArgument();
-    PTSet &L = S[Ptr(lval, -1)];
-    bool change = false;
 
-    for (PTSet::const_iterator i = L.begin(); i != L.end(); ++i) {
-	PTSet &X = S[*i];
-	const std::size_t old_size = X.size();
+    Node *l = findNode(Ptr(lval, -1));
+    if (!l)
+        return false;
 
-	X.insert(Ptr(rval, 0));
-	change = change || X.size() != old_size;
-    }
-
-    return change;
+    return insertDerefPointer(l, Ptr(rval, 0));
 }
 
-static bool applyRule(PointsToSets &S, ASSIGNMENT<
-		    DEREFERENCE<VARIABLE<const llvm::Value *> >,
-		    DEREFERENCE<VARIABLE<const llvm::Value *> >
-		    > const& E)
+bool PointsToGraph::applyRule(ASSIGNMENT<
+                                DEREFERENCE<VARIABLE<const llvm::Value *> >,
+                                DEREFERENCE<VARIABLE<const llvm::Value *> >
+                              > const& E)
 {
     const llvm::Value *lval = E.getArgument1().getArgument().getArgument();
     const llvm::Value *rval = E.getArgument2().getArgument().getArgument();
-    PTSet &L = S[Ptr(lval, -1)];
     bool change = false;
 
-    for (PTSet::const_iterator i = L.begin(); i != L.end(); ++i)
-	if (applyRule(S, (ruleVar(i->first) = *ruleVar(rval)).getSort(),
-				i->second))
-	    change = true;
+    Node *l = findNode(Ptr(lval, -1));
+    if (!l)
+        return false;
+
+    Node *r = findNode(Ptr(rval, -1));
+    if (!r)
+        return false;
+
+    // create a copy of current edges and iterate over this copy,
+    // because this operation can change the edges,
+    // but we need to iterate only over these (old) edges
+    // XXX don't we need copying even when dereferencing only one side??
+    Node *Edges[NODE_EDGES_NUM];
+    memcpy(&Edges, r->getEdges(), sizeof Edges);
+    for (unsigned int I = 0; I < Node::EDGES_NUM; ++I)
+        if (Edges[I])
+            change |= insertDerefBoth(l, Edges[I]);
 
     return change;
 }
 
-static bool applyRule(PointsToSets &S, ASSIGNMENT<
-		    VARIABLE<const llvm::Value *>,
-		    ALLOC<const llvm::Value *>
-		    > const &E)
+bool PointsToGraph::applyRule(ASSIGNMENT<
+                                VARIABLE<const llvm::Value *>,
+                                ALLOC<const llvm::Value *>
+                              > const &E)
 {
     const llvm::Value *lval = E.getArgument1().getArgument();
     const llvm::Value *rval = E.getArgument2().getArgument();
-    PTSet &L = S[Ptr(lval, -1)];
-    const std::size_t old_size = L.size();
 
-    L.insert(Ptr(rval, 0));
-
-    return old_size != L.size();
+    return insert(Ptr(lval, -1), Ptr(rval, 0));
 }
 
-static bool applyRule(PointsToSets &S, ASSIGNMENT<
-		    VARIABLE<const llvm::Value *>,
-		    NULLPTR<const llvm::Value *>
-		    > const &E)
+bool PointsToGraph::applyRule(ASSIGNMENT<
+                                VARIABLE<const llvm::Value *>,
+                                NULLPTR<const llvm::Value *>
+                              > const &E)
 {
     const llvm::Value *lval = E.getArgument1().getArgument();
     const llvm::Value *rval = E.getArgument2().getArgument();
-    PTSet &L = S[Ptr(lval, -1)];
-    const std::size_t old_size = L.size();
 
-    L.insert(Ptr(rval, 0));
+    assert(isa<ConstantPointerNull>(rval) && "Not a NULL");
 
-    return old_size != L.size();
+    return insert(Ptr(lval, -1), Ptr(rval, 0));
 }
 
-static bool applyRule(PointsToSets &S, ASSIGNMENT<
-		    DEREFERENCE<VARIABLE<const llvm::Value *> >,
-		    NULLPTR<const llvm::Value *>
-		    > const &E)
+bool PointsToGraph::applyRule(ASSIGNMENT<
+                                DEREFERENCE<VARIABLE<const llvm::Value *> >,
+                                NULLPTR<const llvm::Value *>
+                              > const &E)
 {
     const llvm::Value *lval = E.getArgument1().getArgument().getArgument();
     const llvm::Value *rval = E.getArgument2().getArgument();
-    PTSet &L = S[Ptr(lval, -1)];
-    bool change = false;
 
-    for (PTSet::const_iterator i = L.begin(); i != L.end(); ++i) {
-	PTSet &X = S[*i];
-	const std::size_t old_size = X.size();
+    assert(isa<ConstantPointerNull>(rval) && "Not a NULL");
 
-	X.insert(Ptr(rval, 0));
-	change = change || X.size() != old_size;
-    }
+    Node *l = findNode(Ptr(lval, -1));
+    if (!l)
+        return false;
 
-    return change;
+    return insertDerefPointer(l, Ptr(rval, 0));
 }
 
-static bool applyRule(PointsToSets &S, DEALLOC<const llvm::Value *>) {
+bool PointsToGraph::applyRule(DEALLOC<const llvm::Value *>) {
     return false;
 }
 
-static bool applyRules(const RuleCode &RC, PointsToSets &S,
-		const llvm::DataLayout &DL)
+bool PointsToGraph::applyRules(const RuleCode &RC, const llvm::DataLayout &DL)
 {
     const llvm::Value *lval = RC.getLvalue();
     const llvm::Value *rval = RC.getRvalue();
 
     switch (RC.getType()) {
     case RCT_VAR_ASGN_ALLOC:
-	return applyRule(S, (ruleVar(lval) = ruleAllocSite(rval)).getSort());
+        return applyRule((ruleVar(lval) = ruleAllocSite(rval)).getSort());
     case RCT_VAR_ASGN_NULL:
-	return applyRule(S, (ruleVar(lval) = ruleNull(rval)).getSort());
+        return applyRule((ruleVar(lval) = ruleNull(rval)).getSort());
     case RCT_VAR_ASGN_VAR:
-	return applyRule(S, (ruleVar(lval) = ruleVar(rval)).getSort());
+        return applyRule((ruleVar(lval) = ruleVar(rval)).getSort());
     case RCT_VAR_ASGN_GEP:
-	return applyRule(S, DL,
-			(ruleVar(lval) = ruleVar(rval).gep()).getSort());
+        return applyRule(DL,
+                        (ruleVar(lval) = ruleVar(rval).gep()).getSort());
     case RCT_VAR_ASGN_REF_VAR:
-	return applyRule(S, (ruleVar(lval) = &ruleVar(rval)).getSort());
+        return applyRule((ruleVar(lval) = &ruleVar(rval)).getSort());
     case RCT_VAR_ASGN_DREF_VAR:
-	return applyRule(S, (ruleVar(lval) = *ruleVar(rval)).getSort());
+        return applyRule((ruleVar(lval) = *ruleVar(rval)).getSort());
     case RCT_DREF_VAR_ASGN_NULL:
-	return applyRule(S, (*ruleVar(lval) = ruleNull(rval)).getSort());
+        return applyRule((*ruleVar(lval) = ruleNull(rval)).getSort());
     case RCT_DREF_VAR_ASGN_VAR:
-	return applyRule(S, (*ruleVar(lval) = ruleVar(rval)).getSort());
+        return applyRule((*ruleVar(lval) = ruleVar(rval)).getSort());
     case RCT_DREF_VAR_ASGN_REF_VAR:
-	return applyRule(S, (*ruleVar(lval) = &ruleVar(rval)).getSort());
+        return applyRule((*ruleVar(lval) = &ruleVar(rval)).getSort());
     case RCT_DREF_VAR_ASGN_DREF_VAR:
-	return applyRule(S, (*ruleVar(lval) = *ruleVar(rval)).getSort());
+        return applyRule((*ruleVar(lval) = *ruleVar(rval)).getSort());
     case RCT_DEALLOC:
-	return applyRule(S, ruleDeallocSite(RC.getValue()).getSort());
+        return applyRule(ruleDeallocSite(RC.getValue()).getSort());
     default:
-	assert(0);
+        assert(0 && "Unknown rule code");
     }
 }
 
@@ -573,24 +942,66 @@ static PointsToSets &pruneByType(PointsToSets &S) {
   return S;
 }
 
-static PointsToSets &fixpoint(const ProgramStructure &P, PointsToSets &S)
+const PointsToGraph& PointsToGraph::build(void)
 {
-  bool change;
+    DataLayout DL(&PS->getModule());
 
-  DataLayout DL(&P.getModule());
+    for (ProgramStructure::const_iterator I = PS->begin(); I != PS->end(); ++I)
+        applyRules(*I, DL);
 
-  do {
-    change = false;
-
-    for (ProgramStructure::const_iterator i = P.begin(); i != P.end(); ++i)
-      change |= applyRules(*i, S, DL);
-  } while (change);
-
-  return S;
+    return *this;
 }
 
-PointsToSets &computePointsToSets(const ProgramStructure &P, PointsToSets &S) {
-  return pruneByType(fixpoint(P, S));
+PointsToSets &computePointsToSets(const ProgramStructure &P, PointsToSets &S,
+                                  unsigned int K)
+{
+    PointsToSets TmpPTS;
+    unsigned int Runs, I;
+
+    if (K) {
+        Runs = (unsigned int) (log(K) / log(2)); // transfer to base of 2
+        if (!Runs)
+            Runs = 1;
+
+#ifdef PS_DEBUG
+        errs() << "[Points-to]: Running algorithm " << Runs << " times\n";
+#endif // PS_DEBUG
+
+        for (I = 0; I < Runs; ++I) {
+            PointsToGraph PTG(&P, new IDBitsCategory(I));
+            PTG.toPointsToSets(S);
+        }
+    // if K is not given, compute number of runs from first run
+    // XXX or use program structure?
+    } else {
+        // Steengaard's analysis is the fastest but least accurate.
+        // However, points-to sets computed by steengaard's analysis
+        // gives us upper bound. They can be now only
+        // reduced. Deduce next steps from this first run
+        PointsToGraph PTG(&P, new AllInOneCategory());
+        PTG.toPointsToSets(S);
+
+        K = S.getContainer().size();
+        // use log2(n) runs of the algorithm
+        Runs = (unsigned int) (log(K) / log(2));
+        // setting Runs to 1 here has no effect but writing out
+        // correct debug message
+        if (!Runs)
+            Runs = 1;
+
+#ifdef PS_DEBUG
+        errs() << "[Points-to]: Guessing number of runs\n";
+        errs() << "[Points-to]: Running algorithm " << Runs << " times\n";
+#endif // PS_DEBUG
+
+        // I = 1 because we have already done one run
+        for (I = 1; I < Runs; ++I) {
+            PointsToGraph PTG(&P, new IDBitsCategory(I));
+            PTG.toPointsToSets(S);
+        }
+    }
+
+    return pruneByType(S);
 }
 
 const PTSet &
